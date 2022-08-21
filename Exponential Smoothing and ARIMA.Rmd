@@ -1,0 +1,391 @@
+---
+title: "Forecasting the electricity consumption of Sweden using exponential smoothing and ARIMA models"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Import packages
+
+```{r libraries, message=FALSE, warning=FALSE, paged.print=FALSE}
+rm(list=ls())
+#install.packages("pacman")
+pacman::p_load(AER, dplyr, ggplot2, fpp3, forecast, caTools, TSstudio, MASS, fpp3, reshape2, tsibble, seasonal, urca, tseries, readxl) 
+```
+
+### Import data
+
+```{r}
+df <- read_excel("/Users/erikkonstenius/Downloads/data_pa.xlsx", col_types = c("date", "numeric"))
+```
+
+### Convert to time series object
+
+```{r}
+df_ts <- ts(df$Consumption, start = c(1990,1), end = c(2022,5), frequency = 12)
+df_ts <-as_tsibble(df_ts, index = Date)
+```
+
+### Splitting the data into train set and test set
+
+```{r}
+train <- df_ts %>%
+  filter(index <= max(index)-12*4)
+test <- df_ts %>%
+  filter(index > max(index)-12*4)
+```
+
+### Exploratory data analysis
+
+```{r}
+autoplot(train, value) + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Energy consumption in Sweden 1990-2022")
+```
+
+```{r}
+gg_season(train, value, period = "year") + 
+  xlab('Month') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Seasonality")
+```
+
+```{r}
+gg_subseries(train, value) + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Seasonal subseries plot")
+```
+
+```{r}
+ACF(train, value, lag_max = 30) %>% autoplot() + 
+  xlab('Lags') + 
+  ylab('ACF') +
+  labs(title = "ACF Plot")
+```
+
+```{r}
+Box.test(df_ts$value, lag = 1, type = "Ljung")
+```
+
+### Stationarity
+
+```{r}
+train %>% autoplot(value %>% difference(lag = 12)) + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh), differenced') +
+  labs(title = 'Energy consumption (GWh), seasonally differenced')
+train %>% autoplot(value %>% difference())+ 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh), differenced') +
+  labs(title = 'Energy consumption (GWh), differenced')
+train %>% autoplot(value %>% difference(lag = 12) %>% difference())+ 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh), differenced') +
+  labs(title = 'Energy consumption (GWh), both differenced and seasonally differenced')
+```
+
+```{r}
+#perform KPSS test assuming trend
+summary(ur.kpss(df_ts$value, type = "tau"))
+
+#perform KPSS test assuming no trend
+summary(ur.kpss(df_ts$value, type = "mu"))
+```
+
+```{r}
+summary(ur.df(df_ts$value, type = "trend", selectlags = c("AIC"), lags = 12))
+```
+
+```{r}
+summary(ur.df(df_ts$value, type = "drift", selectlags = c("AIC"), lags = 12))
+```
+
+```{r}
+train %>%
+  mutate(diff_value = value - lag(value,12)) -> train
+```
+
+```{r}
+autoplot(train, diff_value) + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Energy consumption in Sweden (seasonally differenced)")
+```
+
+```{r}
+gg_season(train, diff_value, period = "year") + 
+  xlab('Month') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Seasonality (seasonally differenced)")
+```
+
+```{r}
+summary(ur.kpss(train$diff_value, type = "mu"))
+```
+
+```{r}
+summary(ur.df(tail(train, n =329)$diff_value, type = "drift",selectlags = "AIC", lags = 12))
+```
+
+```{r}
+train %>%
+  ACF( diff_value ) %>%
+  autoplot() +
+  labs( title = "ACF")
+
+train %>%
+  PACF( diff_value ) %>%
+  autoplot() +
+  labs( title = "PACF")
+```
+
+# Creating the ARIMA models
+
+```{r}
+fit <- train %>%
+  model(
+  auto = ARIMA(value, stepwise = FALSE, approx = FALSE),
+  model_1 = ARIMA(value ~ pdq(1,0,1) + PDQ(0,1,1)),
+  model_2 = ARIMA(value ~ pdq(1,0,3) + PDQ(0,1,1))
+)
+```
+
+```{r}
+fit %>% pivot_longer(everything(), names_to = "Model name",
+                     values_to = "Orders")
+```
+
+```{r}
+glance(fit) %>% arrange(AICc) %>% dplyr::select(.model:BIC)
+```
+
+```{r}
+fit %>%dplyr::select(auto) %>% gg_tsresiduals(lag=36)
+```
+
+```{r}
+fit %>%dplyr::select(model_1) %>% gg_tsresiduals(lag=36)
+```
+
+```{r}
+fit %>%dplyr::select(model_2) %>% gg_tsresiduals(lag=36)
+```
+
+```{r}
+augment(fit) %>%
+  filter(.model == "auto") %>%
+  features(.innov, ljung_box, lag=24, dof=4)
+```
+
+```{r}
+fit %>%
+residuals() %>%
+features(.resid, features = ljung_box, lag = 20)
+```
+
+```{r}
+#augment(fit) %>%
+#  filter(.model == "auto") %>%
+#  features(.innov, shapiro.test, lag=24, dof=4)
+```
+
+```{r}
+forecast(fit, h=48) %>%
+  filter(.model=='auto') %>%
+  autoplot(df_ts, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+```
+
+```{r}
+forecast(fit, h=48) %>%
+  filter(.model=='auto') %>%
+  autoplot(test, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+```
+
+```{r}
+forecast(fit, h=48) %>%
+  filter(.model=='model_1') %>%
+  autoplot(df_ts, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+```
+
+```{r}
+forecast(fit, h=48) %>%
+  filter(.model=='model_1') %>%
+  autoplot(test, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+```
+
+```{r}
+forecast(fit, h=48) %>%
+  filter(.model=='model_2') %>%
+  autoplot(df_ts, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+```
+
+```{r}
+forecast(fit, h=48) %>%
+  filter(.model=='model_2') %>%
+  autoplot(test, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+```
+
+Exponential smoothing
+
+```{r}
+seats_dcmp <- train%>%
+model(seats = X_13ARIMA_SEATS(value ~ seats())) %>%
+components()
+plot.s <- autoplot(seats_dcmp)+ 
+  xlab('Date')
+print(plot.s)
+```
+
+```{r}
+model_ets <- train %>%
+  model(model_1 = ETS(value ~ error("A") + trend("N") + season("A")),
+        model_2 = ETS(value ~ error("A") + trend("A") + season("A")),
+        model_3 = ETS(value ~ error("A") + trend("Ad") + season("A")),
+        auto = ETS(value))
+```
+
+```{r}
+report(model_ets %>%
+dplyr::select(model_1))
+```
+
+```{r}
+report(model_ets %>%
+dplyr::select(model_2))
+```
+
+```{r}
+report(model_ets %>%
+dplyr::select(model_3))
+```
+
+```{r}
+report(model_ets %>%
+dplyr::select(auto))
+```
+
+```{r}
+model_ets %>%
+dplyr::select(model_1) %>%
+gg_tsresiduals(type = "innovation")
+```
+
+```{r}
+model_ets %>%
+dplyr::select(model_2) %>%
+gg_tsresiduals(type = "innovation")
+```
+
+```{r}
+model_ets %>%
+dplyr::select(model_3) %>%
+gg_tsresiduals(type = "innovation")
+```
+
+```{r}
+model_ets %>%
+residuals() %>%
+features(.resid, features = ljung_box, lag = 20)
+```
+
+```{r}
+fc_ets <- model_ets %>%
+forecast(test)
+
+accuracy(fc_ets, df_ts %>%
+dplyr::select(value))
+```
+
+```{r}
+plot_guess <- model_ets %>%
+  dplyr::select(model_1) %>%
+  forecast(test) %>%
+  autoplot(df_ts, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+
+print(plot_guess)
+```
+
+```{r}
+plot_guess <- model_ets %>%
+  dplyr::select(model_1) %>%
+  forecast(test) %>%
+  autoplot(test, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+
+print(plot_guess)
+```
+
+```{r}
+plot_guess <- model_ets %>%
+  dplyr::select(model_2) %>%
+  forecast(test) %>%
+  autoplot(df_ts, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+
+print(plot_guess)
+```
+
+```{r}
+plot_guess <- model_ets %>%
+  dplyr::select(model_2) %>%
+  forecast(test) %>%
+  autoplot(test, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+
+print(plot_guess)
+```
+
+```{r}
+plot_guess <- model_ets %>%
+  dplyr::select(model_3) %>%
+  forecast(test) %>%
+  autoplot(df_ts, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+
+print(plot_guess)
+```
+
+```{r}
+plot_guess <- model_ets %>%
+  dplyr::select(model_3) %>%
+  forecast(test) %>%
+  autoplot(test, color = "darkorange3") + 
+  xlab('Date') + 
+  ylab('Energy consumption (GWh)') +
+  labs(title = "Forecast of energy consumption (GWh) of Sweden")
+
+print(plot_guess)
+```
